@@ -40,7 +40,7 @@ export async function hasWorktreeGitMarker(workspacePath: string | null | undefi
   return workspacePath ? pathExists(path.join(workspacePath, '.git')) : false;
 }
 
-function isWorktreeWorkspace(workspace: LocalWorkspaceCleanupTarget): boolean {
+export function isWorktreeWorkspace(workspace: LocalWorkspaceCleanupTarget): boolean {
   if (!workspace.type) return workspace.kind === 'worktree';
   return (
     resolveWorkspaceKind({
@@ -51,7 +51,7 @@ function isWorktreeWorkspace(workspace: LocalWorkspaceCleanupTarget): boolean {
   );
 }
 
-async function workspaceHasRemainingTasks(
+export async function workspaceHasRemainingTasks(
   workspaceId: string,
   excludeArchived: boolean
 ): Promise<boolean> {

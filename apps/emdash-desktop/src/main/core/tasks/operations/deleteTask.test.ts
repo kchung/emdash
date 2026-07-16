@@ -13,6 +13,9 @@ const mocks = vi.hoisted(() => ({
   gitExec: vi.fn(),
   getProject: vi.fn(),
   getProjectById: vi.fn(),
+  getTask: vi.fn(),
+  isActive: vi.fn(),
+  runUnmountedTeardown: vi.fn(),
   selectLimit: vi.fn(),
   teardownTask: vi.fn(),
 }));
@@ -48,7 +51,18 @@ vi.mock('@main/core/projects/operations/getProjects', () => ({
 
 vi.mock('@main/core/tasks/task-session-manager', () => ({
   taskSessionManager: {
+    getTask: mocks.getTask,
     teardownTask: mocks.teardownTask,
+  },
+}));
+
+vi.mock('./unmounted-workspace-teardown', () => ({
+  runTeardownScriptForUnmountedWorkspace: mocks.runUnmountedTeardown,
+}));
+
+vi.mock('@main/core/workspaces/workspace-registry', () => ({
+  workspaceRegistry: {
+    isActive: mocks.isActive,
   },
 }));
 
@@ -78,6 +92,7 @@ describe('deleteTask', () => {
     mocks.createBoundExec.mockReturnValue({ exec: mocks.gitExec });
     mocks.getProject.mockReturnValue(undefined);
     mocks.getProjectById.mockResolvedValue(undefined);
+    mocks.isActive.mockReturnValue(false);
   });
 
   it('deletes both the aggregate view-state key and the dedicated tabs key', async () => {
@@ -101,6 +116,94 @@ describe('deleteTask', () => {
     await deleteTask('project-1', 'task-1', { deleteWorktree: false });
 
     expect(mocks.deleteIndex).not.toHaveBeenCalled();
+  });
+
+  it('runs the standalone teardown script when the task has no live session', async () => {
+    const fakeProject = { removeTaskWorktree: vi.fn() };
+    mocks.getProject.mockReturnValue(fakeProject);
+    mocks.getTask.mockReturnValue(undefined);
+    mocks.teardownTask.mockResolvedValue({ success: true });
+    mocks.runUnmountedTeardown.mockResolvedValue(undefined);
+    mocks.selectLimit
+      .mockResolvedValueOnce([{ id: 'task-1', name: 'Task One', workspaceId: 'workspace-1' }])
+      .mockResolvedValueOnce([
+        {
+          id: 'workspace-1',
+          type: 'local',
+          kind: 'worktree',
+          location: 'local',
+          path: '/tmp/worktree',
+          branchName: null,
+          config: null,
+        },
+      ])
+      .mockResolvedValueOnce([{ id: 'workspace-1', kind: 'worktree' }])
+      .mockResolvedValueOnce([]);
+
+    await deleteTask('project-1', 'task-1');
+
+    expect(mocks.runUnmountedTeardown).toHaveBeenCalledWith(
+      expect.objectContaining({
+        project: fakeProject,
+        projectId: 'project-1',
+        task: { id: 'task-1', name: 'Task One' },
+        workspace: expect.objectContaining({ id: 'workspace-1', path: '/tmp/worktree' }),
+      })
+    );
+  });
+
+  it('skips the standalone teardown script when the task had a live session', async () => {
+    mocks.getProject.mockReturnValue({ removeTaskWorktree: vi.fn() });
+    mocks.getTask.mockReturnValue({ taskId: 'task-1' });
+    mocks.teardownTask.mockResolvedValue({ success: true });
+    mocks.selectLimit
+      .mockResolvedValueOnce([{ id: 'task-1', name: 'Task One', workspaceId: 'workspace-1' }])
+      .mockResolvedValueOnce([
+        {
+          id: 'workspace-1',
+          type: 'local',
+          kind: 'worktree',
+          location: 'local',
+          path: '/tmp/worktree',
+          branchName: null,
+          config: null,
+        },
+      ])
+      .mockResolvedValueOnce([{ id: 'workspace-1', kind: 'worktree' }])
+      .mockResolvedValueOnce([]);
+
+    await deleteTask('project-1', 'task-1');
+
+    expect(mocks.runUnmountedTeardown).not.toHaveBeenCalled();
+  });
+
+  it('skips the standalone teardown script when the workspace is mounted or mid-acquire', async () => {
+    mocks.getProject.mockReturnValue({ removeTaskWorktree: vi.fn() });
+    // Mid-bootstrap: not yet registered in the session manager, but the
+    // workspace registry has a live or in-flight entry.
+    mocks.getTask.mockReturnValue(undefined);
+    mocks.isActive.mockReturnValue(true);
+    mocks.teardownTask.mockResolvedValue({ success: true });
+    mocks.selectLimit
+      .mockResolvedValueOnce([{ id: 'task-1', name: 'Task One', workspaceId: 'workspace-1' }])
+      .mockResolvedValueOnce([
+        {
+          id: 'workspace-1',
+          type: 'local',
+          kind: 'worktree',
+          location: 'local',
+          path: '/tmp/worktree',
+          branchName: null,
+          config: null,
+        },
+      ])
+      .mockResolvedValueOnce([{ id: 'workspace-1', kind: 'worktree' }])
+      .mockResolvedValueOnce([]);
+
+    await deleteTask('project-1', 'task-1');
+
+    expect(mocks.isActive).toHaveBeenCalledWith('workspace-1');
+    expect(mocks.runUnmountedTeardown).not.toHaveBeenCalled();
   });
 
   it('removes an owned local worktree by recorded path when the project is not mounted', async () => {

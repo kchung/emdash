@@ -118,7 +118,9 @@ export async function runLifecycleScriptWithPolicy({
   policy,
   logPrefix,
 }: {
-  workspace: Workspace;
+  // Only the lifecycle service is needed, so unmounted teardown (deleteTask on a
+  // task without a live workspace) can pass a standalone LifecycleScriptService.
+  workspace: Pick<Workspace, 'lifecycleService'>;
   projectId: string;
   taskId: string;
   workspaceId: string;
