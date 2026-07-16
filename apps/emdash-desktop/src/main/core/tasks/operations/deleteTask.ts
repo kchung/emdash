@@ -4,6 +4,7 @@ import { projectManager } from '@main/core/projects/project-manager';
 import { taskSessionManager } from '@main/core/tasks/task-session-manager';
 import { viewStateService } from '@main/core/view-state/view-state-service';
 import { getProvisionedWorkspaceBranch } from '@main/core/workspaces/workspace-branch';
+import { workspaceRegistry } from '@main/core/workspaces/workspace-registry';
 import { db } from '@main/db/client';
 import { tasks, workspaces } from '@main/db/schema';
 import { log } from '@main/lib/logger';
@@ -15,6 +16,7 @@ import {
   removeOwnedLocalWorktreeDirectoryIfUnused,
   removeWorktreeIfUnused,
 } from './task-lifecycle-utils';
+import { runTeardownScriptForUnmountedWorkspace } from './unmounted-workspace-teardown';
 
 export async function deleteTask(
   projectId: string,
@@ -27,6 +29,16 @@ export async function deleteTask(
   if (!task) return;
 
   const project = projectManager.getProject(projectId);
+
+  // Captured before teardownTask, which removes the entry. Without a live session
+  // the lifecycle teardown is a no-op and the teardown script must run standalone
+  // before the worktree is removed below. A task mid-bootstrap is not yet in the
+  // session manager (registration happens after acquire completes), so also treat
+  // a mounted or in-flight registry workspace as live — otherwise the standalone
+  // script would race the still-running setup script.
+  const hadLiveSession =
+    taskSessionManager.getTask(taskId) !== undefined ||
+    (task.workspaceId !== null && workspaceRegistry.isActive(task.workspaceId));
 
   if (project) {
     const teardownResult = await taskSessionManager.teardownTask(taskId, 'terminate').catch((e) => {
@@ -67,6 +79,17 @@ export async function deleteTask(
   telemetryService.capture('task_deleted', { project_id: projectId, task_id: taskId });
 
   if (deleteWorktree && wsRow) {
+    if (project && !hadLiveSession) {
+      await runTeardownScriptForUnmountedWorkspace({
+        project,
+        projectId,
+        task: { id: task.id, name: task.name },
+        workspace: wsRow,
+      }).catch((e) => {
+        log.warn('deleteTask: unmounted teardown script failed', { taskId, error: String(e) });
+      });
+    }
+
     let worktreeRemoved = false;
     if (project) {
       worktreeRemoved = await removeWorktreeIfUnused(wsRow, project, false);
