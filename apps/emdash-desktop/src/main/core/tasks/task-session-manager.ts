@@ -65,6 +65,11 @@ export type TaskManagerHooks = {
  */
 export type TaskTeardownMode = TeardownMode | 'archive';
 
+export type TaskTeardownAttempt = {
+  handled: boolean;
+  result: Result<void, TeardownTaskError>;
+};
+
 export async function executeTeardown(
   task: TaskProvider,
   workspaceId: string,
@@ -161,7 +166,19 @@ class TaskSessionManager {
     taskId: string,
     mode: TaskTeardownMode = 'terminate'
   ): Promise<Result<void, TeardownTaskError>> {
-    const result = this._lifecycle.teardown(
+    return (await this.teardownTaskIfPresent(taskId, mode)).result;
+  }
+
+  /**
+   * Atomically reports whether teardown found an active or already-tearing-down
+   * lifecycle entry. Callers that provide a persisted fallback use this instead of
+   * checking getTask() before teardown, which would leave a registration race.
+   */
+  async teardownTaskIfPresent(
+    taskId: string,
+    mode: TaskTeardownMode = 'terminate'
+  ): Promise<TaskTeardownAttempt> {
+    const pending = this._lifecycle.teardown(
       taskId,
       async ({ taskProvider, persistData, projectId, ctx }) => {
         try {
@@ -183,7 +200,8 @@ class TaskSessionManager {
       }
     );
 
-    return result ?? ok();
+    if (!pending) return { handled: false, result: ok() };
+    return { handled: true, result: await pending };
   }
 
   async teardownAllForProject(projectId: string, mode: TeardownMode): Promise<void> {

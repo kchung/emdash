@@ -1,14 +1,40 @@
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProjectProvider } from '../../projects/project-provider';
-import { runTeardownScriptForUnmountedWorkspace } from './unmounted-workspace-teardown';
+import { runUnmountedTeardown } from './runUnmountedTeardown';
 
 const mocks = vi.hoisted(() => ({
   dispose: vi.fn(),
+  disposeContext: vi.fn(),
   getEffectiveTaskSettings: vi.fn(),
+  getProjectById: vi.fn(),
   lifecycleScriptService: vi.fn(),
+  localExecutionContext: vi.fn(),
+  localProjectSettingsProvider: vi.fn(),
   localTerminalProvider: vi.fn(),
+  logWarn: vi.fn(),
   runLifecycleScriptWithPolicy: vi.fn(),
   selectLimit: vi.fn(),
+}));
+
+vi.mock('@main/core/projects/operations/getProjects', () => ({
+  getProjectById: mocks.getProjectById,
+}));
+
+vi.mock('@main/core/execution-context/local-execution-context', () => ({
+  LocalExecutionContext: mocks.localExecutionContext,
+}));
+
+vi.mock('@main/core/projects/settings/providers/local-project-settings-provider', () => ({
+  LocalProjectSettingsProvider: mocks.localProjectSettingsProvider,
+}));
+
+vi.mock('@main/lib/logger', () => ({
+  log: {
+    warn: mocks.logWarn,
+  },
 }));
 
 vi.mock('@main/db/client', () => ({
@@ -42,6 +68,7 @@ vi.mock('@main/core/workspaces/workspace-lifecycle-service', () => ({
 function makeProject(overrides: { worktreeExists?: boolean } = {}): ProjectProvider {
   const { worktreeExists = true } = overrides;
   return {
+    type: 'local',
     repoPath: '/repo',
     ctx: {},
     fileSystem: {
@@ -63,7 +90,7 @@ const localWorktree = {
   path: '/worktrees/task-1',
 };
 
-describe('runTeardownScriptForUnmountedWorkspace', () => {
+describe('runUnmountedTeardown', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.selectLimit.mockResolvedValue([]);
@@ -74,14 +101,27 @@ describe('runTeardownScriptForUnmountedWorkspace', () => {
       return { dispose: mocks.dispose };
     });
     mocks.runLifecycleScriptWithPolicy.mockResolvedValue({ kind: 'succeeded' });
+    mocks.getProjectById.mockResolvedValue(undefined);
+    mocks.localExecutionContext.mockImplementation(function LocalExecutionContextMock() {
+      return { dispose: mocks.disposeContext };
+    });
+    mocks.localProjectSettingsProvider.mockImplementation(
+      function LocalProjectSettingsProviderMock() {
+        return {
+          get: vi.fn(async () => ({ shellSetup: 'persisted-shell-setup' })),
+          getDefaultBranch: vi.fn(async () => 'main'),
+        };
+      }
+    );
   });
 
   it('runs the teardown script against the worktree and disposes the script service', async () => {
-    await runTeardownScriptForUnmountedWorkspace({
+    await runUnmountedTeardown({
       project: makeProject(),
       projectId: 'project-1',
       task: { id: 'task-1', name: 'Task One' },
       workspace: localWorktree,
+      intent: 'delete',
     });
 
     expect(mocks.runLifecycleScriptWithPolicy).toHaveBeenCalledWith(
@@ -107,11 +147,12 @@ describe('runTeardownScriptForUnmountedWorkspace', () => {
     mocks.runLifecycleScriptWithPolicy.mockRejectedValue(new Error('boom'));
 
     await expect(
-      runTeardownScriptForUnmountedWorkspace({
+      runUnmountedTeardown({
         project: makeProject(),
         projectId: 'project-1',
         task: { id: 'task-1', name: 'Task One' },
         workspace: localWorktree,
+        intent: 'delete',
       })
     ).rejects.toThrow('boom');
 
@@ -121,46 +162,70 @@ describe('runTeardownScriptForUnmountedWorkspace', () => {
   it('skips when a sibling task still references the workspace', async () => {
     mocks.selectLimit.mockResolvedValue([{ id: 'sibling-task' }]);
 
-    await runTeardownScriptForUnmountedWorkspace({
+    await runUnmountedTeardown({
       project: makeProject(),
       projectId: 'project-1',
       task: { id: 'task-1', name: 'Task One' },
       workspace: localWorktree,
+      intent: 'delete',
     });
 
     expect(mocks.runLifecycleScriptWithPolicy).not.toHaveBeenCalled();
   });
 
   it('skips non-local workspaces', async () => {
-    await runTeardownScriptForUnmountedWorkspace({
+    await runUnmountedTeardown({
       project: makeProject(),
       projectId: 'project-1',
       task: { id: 'task-1', name: 'Task One' },
       workspace: { ...localWorktree, type: 'project-ssh', location: 'remote' },
+      intent: 'delete',
     });
 
     expect(mocks.runLifecycleScriptWithPolicy).not.toHaveBeenCalled();
   });
 
-  it('skips project-root workspaces', async () => {
-    await runTeardownScriptForUnmountedWorkspace({
+  it('logs skipped non-local workspaces even when their persisted path is missing', async () => {
+    await runUnmountedTeardown({
+      project: makeProject(),
+      projectId: 'project-1',
+      task: { id: 'task-1', name: 'Task One' },
+      workspace: {
+        ...localWorktree,
+        type: 'project-ssh',
+        location: 'remote',
+        path: null,
+      },
+      intent: 'delete',
+    });
+
+    expect(mocks.logWarn).toHaveBeenCalledWith(
+      expect.stringContaining('skipping teardown script for unmounted non-local workspace'),
+      expect.objectContaining({ workspaceId: 'workspace-1' })
+    );
+  });
+
+  it('runs for a project-root workspace when archiving the last active task', async () => {
+    await runUnmountedTeardown({
       project: makeProject(),
       projectId: 'project-1',
       task: { id: 'task-1', name: 'Task One' },
       workspace: { ...localWorktree, kind: 'project-root' },
+      intent: 'archive',
     });
 
-    expect(mocks.runLifecycleScriptWithPolicy).not.toHaveBeenCalled();
+    expect(mocks.runLifecycleScriptWithPolicy).toHaveBeenCalledOnce();
   });
 
   it('skips when no teardown script is configured', async () => {
     mocks.getEffectiveTaskSettings.mockResolvedValue({ scripts: {} });
 
-    await runTeardownScriptForUnmountedWorkspace({
+    await runUnmountedTeardown({
       project: makeProject(),
       projectId: 'project-1',
       task: { id: 'task-1', name: 'Task One' },
       workspace: localWorktree,
+      intent: 'delete',
     });
 
     expect(mocks.runLifecycleScriptWithPolicy).not.toHaveBeenCalled();
@@ -168,13 +233,52 @@ describe('runTeardownScriptForUnmountedWorkspace', () => {
   });
 
   it('skips when the worktree directory no longer exists', async () => {
-    await runTeardownScriptForUnmountedWorkspace({
+    await runUnmountedTeardown({
       project: makeProject({ worktreeExists: false }),
       projectId: 'project-1',
       task: { id: 'task-1', name: 'Task One' },
       workspace: localWorktree,
+      intent: 'delete',
     });
 
     expect(mocks.runLifecycleScriptWithPolicy).not.toHaveBeenCalled();
+  });
+
+  it('reconstructs local project services when the project is not mounted', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'emdash-persisted-teardown-'));
+    const projectPath = path.join(tempDir, 'project');
+    const worktreePath = path.join(tempDir, 'worktree');
+    await mkdir(projectPath);
+    await mkdir(worktreePath);
+    mocks.getProjectById.mockResolvedValue({
+      type: 'local',
+      id: 'project-1',
+      name: 'Project',
+      path: projectPath,
+      baseRef: 'main',
+      repositoryWorkspaceId: null,
+      createdAt: '',
+      updatedAt: '',
+    });
+
+    try {
+      await runUnmountedTeardown({
+        projectId: 'project-1',
+        task: { id: 'task-1', name: 'Task One' },
+        workspace: { ...localWorktree, path: worktreePath },
+        intent: 'delete',
+      });
+
+      expect(mocks.localProjectSettingsProvider).toHaveBeenCalledWith(
+        'project-1',
+        projectPath,
+        'main',
+        expect.anything()
+      );
+      expect(mocks.runLifecycleScriptWithPolicy).toHaveBeenCalledOnce();
+      expect(mocks.disposeContext).toHaveBeenCalledOnce();
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 });

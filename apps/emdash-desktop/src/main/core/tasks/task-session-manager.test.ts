@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { IExecutionContext } from '@main/core/execution-context/types';
 import type { TaskProvider } from '../projects/project-provider';
-import { executeTeardown } from './task-session-manager';
+import { executeTeardown, taskSessionManager } from './task-session-manager';
 
 const teardown = vi.fn();
 
@@ -64,5 +65,43 @@ describe('executeTeardown', () => {
     expect(terminals.detachAll).not.toHaveBeenCalled();
     // crucially NOT 'terminate', which would run onDestroy and remove the worktree.
     expect(teardown).toHaveBeenCalledWith('workspace-1', 'archive');
+  });
+});
+
+describe('teardownTaskIfPresent', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('reports when no lifecycle entry was available for teardown', async () => {
+    const attempt = await taskSessionManager.teardownTaskIfPresent(
+      'missing-task-presence-test',
+      'archive'
+    );
+
+    expect(attempt).toEqual({ handled: false, result: { success: true, data: undefined } });
+  });
+
+  it('atomically claims and tears down an available lifecycle entry', async () => {
+    const { task } = makeTask();
+    await taskSessionManager.registerTask(
+      'live-task-presence-test',
+      {
+        path: '/tmp/worktree',
+        workspaceId: 'workspace-presence-test',
+        taskProvider: task,
+      },
+      'project-presence-test',
+      {} as IExecutionContext
+    );
+
+    const attempt = await taskSessionManager.teardownTaskIfPresent(
+      'live-task-presence-test',
+      'archive'
+    );
+
+    expect(attempt.handled).toBe(true);
+    expect(attempt.result.success).toBe(true);
+    expect(teardown).toHaveBeenCalledWith('workspace-presence-test', 'archive');
   });
 });
