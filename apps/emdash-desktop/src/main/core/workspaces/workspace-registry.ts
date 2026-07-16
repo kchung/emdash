@@ -4,10 +4,19 @@ import type { Workspace } from './workspace';
 
 export type TeardownMode = 'detach' | 'terminate';
 
+/**
+ * Single-workspace teardown additionally supports 'archive': the workspace is
+ * dismantled like 'detach' (worktree and provider infra survive for a later
+ * restore), but the configured teardown script still runs first so external
+ * resources (simulators, containers, seeded databases) get cleaned up.
+ */
+export type WorkspaceTeardownMode = TeardownMode | 'archive';
+
 type WorkspaceHooks = {
   onCreate?: (workspace: Workspace) => Promise<void>;
   onCreateSideEffect?: (workspace: Workspace) => void;
   onDestroy?: (workspace: Workspace) => Promise<void>;
+  onArchive?: (workspace: Workspace) => Promise<void>;
   onDetach?: (workspace: Workspace) => Promise<void>;
 };
 
@@ -25,6 +34,7 @@ type WorkspaceEntry = {
   refCount: number;
   projectId: string;
   onDestroy?: (workspace: Workspace) => Promise<void>;
+  onArchive?: (workspace: Workspace) => Promise<void>;
   onDetach?: (workspace: Workspace) => Promise<void>;
   /** Single-flight release of the workspace's native leases. */
   release: () => Promise<void>;
@@ -62,6 +72,7 @@ export class WorkspaceRegistry {
           refCount: 1,
           projectId,
           onDestroy: result.onDestroy,
+          onArchive: result.onArchive,
           onDetach: result.onDetach,
           release: once(async () => {
             await workspace.dispose?.();
@@ -83,7 +94,7 @@ export class WorkspaceRegistry {
     return pending;
   }
 
-  async teardown(key: string, mode: TeardownMode = 'terminate'): Promise<void> {
+  async teardown(key: string, mode: WorkspaceTeardownMode = 'terminate'): Promise<void> {
     const entry = this.entries.get(key);
     if (!entry) {
       const inFlight = this.acquiring.get(key);
@@ -100,14 +111,28 @@ export class WorkspaceRegistry {
     }
 
     this.entries.delete(key);
-    if (mode === 'terminate') {
-      await entry.onDestroy?.(entry.workspace);
+    // onDestroy/onArchive need the live workspace (teardown scripts run through
+    // lifecycleService), so they fire before release/dispose. The entry is already
+    // out of the map, so if a hook throws nothing could retry the cleanup — release
+    // and dispose must run regardless.
+    try {
+      if (mode === 'terminate') {
+        await entry.onDestroy?.(entry.workspace);
+      } else if (mode === 'archive') {
+        await entry.onArchive?.(entry.workspace);
+      }
+    } finally {
+      await entry.release();
+      await entry.workspace.lifecycleService.dispose();
+      if (mode !== 'terminate') {
+        await entry.onDetach?.(entry.workspace);
+      }
     }
-    await entry.release();
-    await entry.workspace.lifecycleService.dispose();
-    if (mode === 'detach') {
-      await entry.onDetach?.(entry.workspace);
-    }
+  }
+
+  /** True while the workspace is mounted or an acquisition is in flight. */
+  isActive(key: string): boolean {
+    return this.entries.has(key) || this.acquiring.has(key);
   }
 
   get(key: string): Workspace | undefined {

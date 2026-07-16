@@ -59,7 +59,9 @@ export type TaskManagerHooks = {
  * - `archive`: reap tmux sessions + agent processes like `terminate`, but keep the
  *   workspace/worktree (and the persisted `conversations.session_id`) so the task stays
  *   restorable. Without this, archiving a tmux-backed task leaked its session and agent
- *   process indefinitely (#2689).
+ *   process indefinitely (#2689). Unlike `detach`, archive still runs the configured
+ *   teardown script so external resources (simulators, containers) get cleaned up;
+ *   the setup script re-runs on the next mount, so Restore recreates them.
  */
 export type TaskTeardownMode = TeardownMode | 'archive';
 
@@ -77,9 +79,9 @@ export async function executeTeardown(
     await task.conversations.destroyAll();
     await task.terminals.destroyAll();
   }
-  // Only 'terminate' destroys the workspace (worktree + teardown script). 'archive'
-  // keeps the worktree alive, same as 'detach', so Restore can resume the task.
-  await workspaceRegistry.teardown(workspaceId, mode === 'terminate' ? 'terminate' : 'detach');
+  // Only 'terminate' destroys the workspace/worktree. 'archive' keeps the worktree
+  // alive so Restore can resume the task, but still runs the teardown script.
+  await workspaceRegistry.teardown(workspaceId, mode);
 }
 
 async function cleanupDetachedSessions(

@@ -184,6 +184,38 @@ export function createWorkspaceFactory(
 
     const { logPrefix } = context;
 
+    // Shared by onDestroy and onArchive: settings are re-read at teardown time so
+    // edits to .emdash.json made after mount still apply.
+    const runTeardownScript = async (ws: Workspace) => {
+      const latestProjectSettings = await context.settings.get();
+      const latestTaskSettings = await getEffectiveTaskSettings({
+        projectSettings: context.settings,
+        taskFs: ws.fileSystem,
+        taskConfigPath: ws.configPath,
+      });
+      const latestShellSetup = latestTaskSettings.shellSetup ?? latestProjectSettings.shellSetup;
+      const teardownScript = latestTaskSettings.scripts?.teardown;
+      if (!teardownScript) return;
+
+      await runLifecycleScriptWithPolicy({
+        workspace: ws,
+        projectId: context.projectId,
+        taskId: context.task.id,
+        workspaceId,
+        type: 'teardown',
+        script: teardownScript,
+        shellSetup: latestShellSetup,
+        origin: 'workspace-destroy',
+        policy: {
+          timeoutMs: TEARDOWN_SCRIPT_WAIT_MS,
+          logFailure: true,
+          surfaceFailure: false,
+          continueOnFailure: true,
+        },
+        logPrefix,
+      });
+    };
+
     return {
       workspace,
       sshFilesRuntime: type.kind === 'ssh' ? filesRuntime : undefined,
@@ -288,35 +320,23 @@ export function createWorkspaceFactory(
           gitRepositoryFetchService.stop();
         }
         workspaceFileIndexService.onWorkspaceDeactivated(workspaceId);
-        const latestProjectSettings = await context.settings.get();
-        const latestTaskSettings = await getEffectiveTaskSettings({
-          projectSettings: context.settings,
-          taskFs: ws.fileSystem,
-          taskConfigPath: ws.configPath,
-        });
-        const latestShellSetup = latestTaskSettings.shellSetup ?? latestProjectSettings.shellSetup;
-        const teardownScript = latestTaskSettings.scripts?.teardown;
-
-        if (teardownScript) {
-          await runLifecycleScriptWithPolicy({
-            workspace: ws,
-            projectId: context.projectId,
-            taskId: context.task.id,
-            workspaceId,
-            type: 'teardown',
-            script: teardownScript,
-            shellSetup: latestShellSetup,
-            origin: 'workspace-destroy',
-            policy: {
-              timeoutMs: TEARDOWN_SCRIPT_WAIT_MS,
-              logFailure: true,
-              surfaceFailure: false,
-              continueOnFailure: true,
-            },
-            logPrefix,
-          });
-        }
+        await runTeardownScript(ws);
         await context.extraHooks?.onDestroy?.(ws);
+      },
+
+      // Archive dismantles the live workspace like detach (worktree and provider
+      // infra survive for Restore) but still runs the teardown script so external
+      // resources get cleaned up. Preview servers stop before the script, matching
+      // onDestroy — scripts may free ports or resources a running server holds.
+      // Provider detach hooks run via onDetach, which the registry also fires for
+      // 'archive'.
+      onArchive: async (ws) => {
+        await previewServerService.stopForWorkspace(context.projectId, workspaceId);
+        if (ownsFetchService) {
+          gitRepositoryFetchService.stop();
+        }
+        workspaceFileIndexService.onWorkspaceDeactivated(workspaceId);
+        await runTeardownScript(ws);
       },
 
       onDetach: async (ws) => {

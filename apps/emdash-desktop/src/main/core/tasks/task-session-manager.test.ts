@@ -51,7 +51,9 @@ describe('executeTeardown', () => {
   });
 
   // The regression for #2689: archive must reap the tmux session + agent process
-  // (destroyAll), but keep the workspace/worktree (detach-level teardown) so Restore works.
+  // (destroyAll), but keep the workspace/worktree so Restore works. The registry's
+  // 'archive' mode (not 'terminate') still runs the teardown script without
+  // destroying the worktree or firing provider terminate hooks.
   it('archive reaps tmux + agent but keeps the workspace', async () => {
     const { task, conversations, terminals } = makeTask();
     await executeTeardown(task, 'workspace-1', 'archive');
@@ -61,6 +63,6 @@ describe('executeTeardown', () => {
     expect(conversations.detachAll).not.toHaveBeenCalled();
     expect(terminals.detachAll).not.toHaveBeenCalled();
     // crucially NOT 'terminate', which would run onDestroy and remove the worktree.
-    expect(teardown).toHaveBeenCalledWith('workspace-1', 'detach');
+    expect(teardown).toHaveBeenCalledWith('workspace-1', 'archive');
   });
 });
