@@ -270,6 +270,84 @@ describe('WorkspaceRegistry', () => {
     expect(onDetach).not.toHaveBeenCalled();
   });
 
+  it('archive mode runs onArchive before dispose and onDetach after, never onDestroy', async () => {
+    const registry = new WorkspaceRegistry();
+    const { workspace, dispose } = makeWorkspace('branch:main');
+    const order: string[] = [];
+
+    dispose.mockImplementation(() => {
+      order.push('lifecycleDispose');
+      return undefined;
+    });
+    const onDestroy = vi.fn(async () => {});
+    const onArchive = vi.fn(async () => {
+      order.push('onArchive');
+    });
+    const onDetach = vi.fn(async () => {
+      order.push('onDetach');
+    });
+    const factory = vi.fn(async () => ({ workspace, onDestroy, onArchive, onDetach }));
+
+    await registry.acquire('branch:main', 'test-project', factory);
+    await registry.teardown('branch:main', 'archive');
+
+    expect(onDestroy).not.toHaveBeenCalled();
+    expect(onArchive).toHaveBeenCalledTimes(1);
+    expect(onArchive).toHaveBeenCalledWith(workspace);
+    // onArchive runs the teardown script through lifecycleService, so it must
+    // precede dispose; onDetach handles post-dispose provider cleanup.
+    expect(order).toEqual(['onArchive', 'lifecycleDispose', 'onDetach']);
+  });
+
+  it('still releases and disposes when a teardown hook throws', async () => {
+    const registry = new WorkspaceRegistry();
+    const { workspace, dispose, fileTreeDispose, gitDispose } = makeWorkspace('branch:main');
+    const onArchive = vi.fn(async () => {
+      throw new Error('settings read failed');
+    });
+    const onDetach = vi.fn(async () => {});
+    const factory = vi.fn(async () => ({ workspace, onArchive, onDetach }));
+
+    await registry.acquire('branch:main', 'test-project', factory);
+
+    await expect(registry.teardown('branch:main', 'archive')).rejects.toThrow(
+      'settings read failed'
+    );
+
+    // The entry is already out of the map when hooks run, so a hook throw must
+    // not leak the workspace: leases, lifecycle sessions, and detach cleanup
+    // still run.
+    expect(fileTreeDispose).toHaveBeenCalledTimes(1);
+    expect(gitDispose).toHaveBeenCalledTimes(1);
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(onDetach).toHaveBeenCalledTimes(1);
+    expect(registry.get('branch:main')).toBeUndefined();
+  });
+
+  it('isActive reports mounted and in-flight workspaces, not torn-down ones', async () => {
+    const registry = new WorkspaceRegistry();
+    const { workspace } = makeWorkspace('branch:main');
+    let resolveFactory: ((value: { workspace: Workspace }) => void) | undefined;
+    const factory = vi.fn(
+      () =>
+        new Promise<{ workspace: Workspace }>((resolve) => {
+          resolveFactory = resolve;
+        })
+    );
+
+    expect(registry.isActive('branch:main')).toBe(false);
+
+    const acquired = registry.acquire('branch:main', 'test-project', factory);
+    expect(registry.isActive('branch:main')).toBe(true);
+
+    resolveFactory?.({ workspace });
+    await acquired;
+    expect(registry.isActive('branch:main')).toBe(true);
+
+    await registry.teardown('branch:main');
+    expect(registry.isActive('branch:main')).toBe(false);
+  });
+
   it('does not call onDetach when ref count has not reached zero', async () => {
     const registry = new WorkspaceRegistry();
     const { workspace } = makeWorkspace('branch:main');
